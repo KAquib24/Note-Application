@@ -2,24 +2,8 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { JSONContent } from '@tiptap/core'
 import { Check, ChevronDown, ChevronRight, Copy, List, Star, X } from 'lucide-react'
-import hljs from 'highlight.js/lib/core'
-import python from 'highlight.js/lib/languages/python'
-import javascript from 'highlight.js/lib/languages/javascript'
-import typescript from 'highlight.js/lib/languages/typescript'
-import java from 'highlight.js/lib/languages/java'
-import c from 'highlight.js/lib/languages/c'
-import cpp from 'highlight.js/lib/languages/cpp'
-import xml from 'highlight.js/lib/languages/xml'
-import css from 'highlight.js/lib/languages/css'
-import sql from 'highlight.js/lib/languages/sql'
-import bash from 'highlight.js/lib/languages/bash'
-import json from 'highlight.js/lib/languages/json'
-import yaml from 'highlight.js/lib/languages/yaml'
-import markdown from 'highlight.js/lib/languages/markdown'
 import { safeExternalUrl } from '../editor/links'
-
-const grammars:Record<string,typeof python>={python,javascript,typescript,jsx:javascript,java,c,cpp,html:xml,xml,css,sql,bash,shell:bash,json,yaml,markdown}
-Object.entries(grammars).forEach(([name,grammar])=>{if(!hljs.getLanguage(name))hljs.registerLanguage(name,grammar)})
+import { highlightCode } from '../editor/syntax'
 type Heading={id:string;key:string;title:string;level:number;children:Heading[]}
 type Important={id:string;text:string}
 const kids=(n:JSONContent):JSONContent[]=>Array.isArray(n.content)?n.content:[]
@@ -44,7 +28,7 @@ export function ReaderView({noteId,title,content,items}:{noteId:string;title:str
   if(n.type==='paragraph')return <p className={kids(n).some(c=>c.type==='text'&&c.marks?.some(m=>m.type==='important'))?'reader-important-paragraph':''} style={style} key={key}>{body.length?body:<br/>}</p>
   if(n.type==='heading'){const Tag=('h'+Math.max(1,Math.min(6,Number(a.level)||1))) as keyof JSX.IntrinsicElements;return <Tag key={key} id={entry?.id} data-reader-heading={entry?.id} data-block-id={typeof a.blockId==='string'?a.blockId:undefined} style={style}>{body}</Tag>}
   if(n.type==='bulletList')return <ul key={key}>{body}</ul>;if(n.type==='orderedList')return <ol key={key} start={Number(a.start)||undefined}>{body}</ol>;if(n.type==='listItem')return <li key={key}>{body}</li>;if(n.type==='blockquote')return <blockquote key={key} style={style}>{body}</blockquote>
-  if(n.type==='codeBlock'){const code=plain(n),lang=String(a.language??'plaintext').toLowerCase();let html='';if(lang!=='plaintext'&&hljs.getLanguage(lang)){try{html=hljs.highlight(code,{language:lang,ignoreIllegals:true}).value}catch{html=''}}return <ReaderCode key={key} code={code} language={lang==='plaintext'?'Plain text':lang.toUpperCase()} html={html}/>}
+  if(n.type==='codeBlock'){const code=plain(n),lang=String(a.language??'plaintext').toLowerCase(),html=highlightCode(code,lang)??'';return <ReaderCode key={key} code={code} language={lang==='plaintext'?'Plain text':lang.toUpperCase()} html={html}/>}
   if(n.type==='horizontalRule')return <hr key={key}/>
   if(n.type==='table')return <div key={key} className="reader-table-scroll" role="region" aria-label="Scrollable table" tabIndex={0}><table className="reader-table"><tbody>{body}</tbody></table></div>
   if(n.type==='tableRow')return <tr key={key}>{body}</tr>;if(n.type==='tableHeader')return <th key={key} colSpan={Number(a.colspan)||1} rowSpan={Number(a.rowspan)||1}>{body}</th>;if(n.type==='tableCell')return <td key={key} colSpan={Number(a.colspan)||1} rowSpan={Number(a.rowspan)||1}>{body}</td>

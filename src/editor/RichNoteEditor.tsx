@@ -4,7 +4,7 @@ import { CodeBlock } from '@tiptap/extension-code-block'
 import { Code } from '@tiptap/extension-code'
 import { StarterKit } from '@tiptap/starter-kit'
 import { Placeholder } from '@tiptap/extensions'
-import { Bold, Code2, Italic, List, ListOrdered, Redo2, Strikethrough, Underline, Undo2, Outdent, Indent, Check, LoaderCircle, RotateCcw, Star, Trash2, CornerUpRight, Palette, Highlighter, PanelTop, Square, X, ArrowUp, ArrowDown, Minus, Table2, Rows3, Columns3, Combine, Split, Link2, ExternalLink, Copy, ChevronDown, ChevronRight, Pencil } from 'lucide-react'
+import { Bold, Code2, Italic, List, ListOrdered, Redo2, Strikethrough, Underline, Undo2, Outdent, Indent, Check, LoaderCircle, RotateCcw, Star, Trash2, CornerUpRight, Palette, Highlighter, PanelTop, Square, X, ArrowUp, ArrowDown, Minus, Table2, Rows3, Columns3, Combine, Split, Link2, ExternalLink, Copy, ChevronDown, ChevronRight, Pencil, Menu } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { JSONContent } from '@tiptap/core'
 import { TextStyle, Color } from '@tiptap/extension-text-style'
@@ -14,10 +14,12 @@ import { StableBlockIds } from './blockIds'
 import { ImportantMark } from './important'
 import { applyBlockColor, BlockFormatting } from './blockFormatting'
 import { BlockOperations, canMoveBlock, moveBlock } from './blockOperations'
+import { copyCurrentLine, MultiCursor } from './multiCursor'
 import { TableKit } from '@tiptap/extension-table'
 import { LinkDialog, type LinkItem, type LinkSubject, type LinkTarget } from './LinkDialog'
 import { NoteLink, safeExternalUrl, type NoteLinkAttrs } from './links'
 import { storage } from '../storage'
+import { CodeBlockDecorations } from './codeBlockDecorations'
 
 type Props = { noteId: string; content: JSONContent | string; focusOnMount?: boolean; subjects: LinkSubject[]; items: LinkItem[]; save: (id: string, doc: JSONContent) => boolean; onFlushReady?: (flush:()=>JSONContent)=>void }
 type SaveState = 'saved' | 'saving' | 'failed'
@@ -113,6 +115,8 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
   const [importantFeedback,setImportantFeedback]=useState('')
   const [copyFeedback,setCopyFeedback]=useState('')
   const [selectionMenu,setSelectionMenu]=useState<{x:number;y:number}|null>(null)
+  const [activeHeadingId,setActiveHeadingId]=useState<string|null>(null)
+  const [navigationOpen,setNavigationOpen]=useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const savedSelection = useRef<{from:number;to:number}|null>(null)
   const latest = useRef<JSONContent>(toDocument(content))
@@ -125,11 +129,13 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
     Color.configure({ types: ['textStyle'] }),
     Highlight.configure({ multicolor: true }),
     RichCodeBlock.configure({ enableTabIndentation: true, tabSize: 4, defaultLanguage: 'plaintext' }),
+    CodeBlockDecorations,
     Placeholder.configure({ placeholder: 'Start writing...' }),
     StableBlockIds,
     ImportantMark,
     BlockFormatting,
     BlockOperations,
+    MultiCursor,
     NoteLink,
     TableKit.configure({ table: { resizable: true, cellMinWidth: 72, lastColumnResizable: true } }),
   ], [])
@@ -214,6 +220,18 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
     }
     return { bold: active('bold'), italic: active('italic'), underline: active('underline'), strike: active('strike'), code: active('code'), codeBlock: active('codeBlock'), bullet: active('bulletList'), ordered: active('orderedList'), heading1: active('heading', { level: 1 }), heading2: active('heading', { level: 2 }), heading3: active('heading', { level: 3 }), heading4: active('heading', { level: 4 }), heading5: active('heading', { level: 5 }), heading6: active('heading', { level: 6 }), canMoveUp: current ? canMoveBlock(current, -1) : false, canMoveDown: current ? canMoveBlock(current, 1) : false, inTable: active('table'), canMergeCells: current?.can().mergeCells() ?? false, canSplitCell: current?.can().splitCell() ?? false, important: active('important'), selectionEmpty: current?.state.selection.empty ?? true, document: current?.state.doc, textColor: (current?.getAttributes('textStyle').color as string | null) ?? null, highlightColor: (current?.getAttributes('highlight').color as string | null) ?? null, blockTextColor: blockStyle?.color ?? null, blockBackground: blockStyle?.backgroundColor ?? null, canUndo: current?.can().undo() ?? false, canRedo: current?.can().redo() ?? false, language: (current?.getAttributes('codeBlock').language as string | null) ?? 'plaintext' }
   } })
+  useEffect(() => {
+    if (!editor || typeof IntersectionObserver === 'undefined') return
+    const headings = [...editor.view.dom.querySelectorAll<HTMLElement>('h1[data-block-id],h2[data-block-id],h3[data-block-id],h4[data-block-id],h5[data-block-id],h6[data-block-id]')]
+    if (!headings.length) { setActiveHeadingId(null); return }
+    const observer = new IntersectionObserver(entries => {
+      const visible = entries.filter(entry => entry.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top)
+      const id = visible[0]?.target.getAttribute('data-block-id')
+      if (id) setActiveHeadingId(current => current === id ? current : id)
+    }, { root: null, rootMargin: '-128px 0px -68% 0px', threshold: 0 })
+    headings.forEach(heading => observer.observe(heading))
+    return () => observer.disconnect()
+  }, [editor, state?.document])
   const linkItems = useMemo(() => editor ? items.map(item => item.id === noteId ? { ...item, content: editor.getJSON() } : item) : items, [editor, items, noteId, state?.document])
 
   const openLinkDialog = useCallback((current: NonNullable<typeof editor>) => {
@@ -341,11 +359,12 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
   const renderOutline=(entries:OutlineEntry[],parentNumber:string[]=[]):React.ReactNode=>entries.map((entry,index)=>{
     const parts=[...parentNumber,parentNumber.length===0?String(index+1).padStart(2,'0'):String(index+1)],number=parts.join('.')
     const expandable=entry.children.length>0,collapsed=closedHeadings.has(entry.id)
-    const activate=()=>{if(entry.kind==='nested-note'){navigate(`/note/${entry.id}`);return}const target=activeEditor.view.dom.querySelector<HTMLElement>(`[data-block-id="${CSS.escape(entry.id)}"]`);if(target){target.scrollIntoView({behavior:'smooth',block:'start'});target.classList.add('link-target-flash');window.setTimeout(()=>target.classList.remove('link-target-flash'),1500)}activeEditor.chain().focus().run()}
-    return <div className={`editor-outline-node outline-${entry.kind}`} key={entry.id}><div className="editor-outline-row" style={{'--outline-depth':parentNumber.length} as React.CSSProperties}>{expandable?<button type="button" className="outline-expander" aria-label={`${collapsed?'Expand':'Collapse'} ${entry.title}`} onClick={()=>toggleOutline(entry.id)}>{collapsed?<ChevronRight size={13}/>:<ChevronDown size={13}/>}</button>:<span className="outline-expander-spacer"/>}<button type="button" className="outline-target" onClick={activate}><span className="outline-number">{number}</span>{entry.kind==='section'?<span className="outline-badge section-badge">SECTION</span>:entry.kind==='heading'?<span className={`outline-badge heading-badge h${entry.level}`}>H{entry.level}</span>:<span className="outline-badge note-badge">NOTE</span>}<span className="outline-title">{entry.title}</span></button></div>{expandable&&!collapsed&&<div className="editor-outline-children">{renderOutline(entry.children,parts)}</div>}</div>
+    const activate=()=>{setNavigationOpen(false);if(entry.kind==='nested-note'){navigate(`/note/${entry.id}`);return}const target=activeEditor.view.dom.querySelector<HTMLElement>(`[data-block-id="${CSS.escape(entry.id)}"]`);if(target){target.scrollIntoView({behavior:'smooth',block:'start'});target.classList.add('link-target-flash');window.setTimeout(()=>target.classList.remove('link-target-flash'),1500)}activeEditor.chain().focus().run()}
+    const isActive=activeHeadingId===entry.id
+    return <div className={`editor-outline-node outline-${entry.kind}${isActive?' is-active':''}`} key={entry.id}><div className="editor-outline-row" style={{'--outline-depth':parentNumber.length} as React.CSSProperties}>{expandable?<button type="button" className="outline-expander" aria-label={`${collapsed?'Expand':'Collapse'} ${entry.title}`} onClick={()=>toggleOutline(entry.id)}>{collapsed?<ChevronRight size={13}/>:<ChevronDown size={13}/>}</button>:<span className="outline-expander-spacer"/>}<button type="button" className="outline-target" aria-current={isActive?'location':undefined} onClick={activate}><span className="outline-number">{number}</span>{entry.kind==='section'?<span className="outline-badge section-badge">SECTION</span>:entry.kind==='heading'?<span className={`outline-badge heading-badge h${entry.level}`}>H{entry.level}</span>:<span className="outline-badge note-badge">NOTE</span>}<span className="outline-title">{entry.title}</span></button></div>{expandable&&!collapsed&&<div className="editor-outline-children">{renderOutline(entry.children,parts)}</div>}</div>
   })
   const copyPage=async()=>{try{const html=activeEditor.getHTML(),plain=activeEditor.getText({blockSeparator:'\n\n'});if(navigator.clipboard?.write&&typeof ClipboardItem!=='undefined')await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([html],{type:'text/html'}),'text/plain':new Blob([plain],{type:'text/plain'})})]);else await navigator.clipboard.writeText(plain);setCopyFeedback('Page copied.');window.setTimeout(()=>setCopyFeedback(''),1800)}catch{setCopyFeedback('Could not access the clipboard.');window.setTimeout(()=>setCopyFeedback(''),2200)}}
-  const jumpToSource = (note: ImportantNote) => activeEditor.chain().setTextSelection({ from: note.from, to: note.to }).scrollIntoView().focus().run()
+  const jumpToSource = (note: ImportantNote) => {setNavigationOpen(false);activeEditor.chain().setTextSelection({ from: note.from, to: note.to }).scrollIntoView().focus().run();const target=activeEditor.view.dom.querySelector<HTMLElement>(`[data-important-id="${CSS.escape(note.id)}"]`);if(target){target.classList.add('important-source-flash');window.setTimeout(()=>target.classList.remove('important-source-flash'),1500)}}
   const removeImportant = (note: ImportantNote) => activeEditor.chain().setTextSelection({ from: note.from, to: note.to }).unsetMark('important').run()
   const rememberColor = (value:string) => { const next=[value,...recentColors.filter(color=>color.toLocaleLowerCase()!==value.toLocaleLowerCase())].slice(0,8);setRecentColors(next);storage.set('recent-colors',next) }
   const saveColor=()=>{const name=window.prompt('Name this color');if(!name?.trim())return;const next=[...savedColors,{id:crypto.randomUUID(),name:name.trim(),color:state.textColor??textColor}];setSavedColors(next);storage.set('saved-colors',next)}
@@ -399,6 +418,7 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
   }
   return <section className="rich-editor" aria-label="Note editor">
     <div className="editor-toolbar" role="toolbar" aria-label="Text formatting">
+      <ToolbarButton label="Open note navigation" onClick={()=>setNavigationOpen(true)}><Menu size={16}/><span className="navigation-tool-label">Navigation</span></ToolbarButton>
       <ToolbarButton label="Bold (Ctrl+B)" active={state.bold} onClick={() => run(chain => chain.toggleBold())}><Bold size={16}/></ToolbarButton>
       <ToolbarButton label="Italic (Ctrl+I)" active={state.italic} onClick={() => run(chain => chain.toggleItalic())}><Italic size={16}/></ToolbarButton>
       <ToolbarButton label="Underline (Ctrl+U)" active={state.underline} onClick={() => run(chain => chain.toggleUnderline())}><Underline size={16}/></ToolbarButton>
@@ -414,6 +434,7 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
       <ToolbarButton label="Insert or edit link (Ctrl+K)" onClick={() => openLinkDialog(editor)}><Link2 size={16}/></ToolbarButton>
       <ToolbarButton label="Mark as Important (Ctrl+Shift+I)" active={state.important} disabled={state.selectionEmpty} onClick={() => toggleImportantSelection()}><Star size={16}/></ToolbarButton>
       <ToolbarButton label="Copy entire page" onClick={()=>void copyPage()}><Copy size={15}/><span className="copy-page-label">Copy Page</span></ToolbarButton>
+      <ToolbarButton label="Copy current line" onClick={()=>{copyCurrentLine(editor);setCopyFeedback('Line copied.');window.setTimeout(()=>setCopyFeedback(''),1500)}}><Copy size={14}/><span className="copy-page-label">Copy Line</span></ToolbarButton>
       <span className="editor-tool-separator"/>
       <ColorPicker label="Text color" icon={<Palette size={15}/>} value={state.textColor ?? textColor} recent={recentColors} saved={savedColors} onSaveColor={saveColor} onRenameColor={renameColor} onDeleteColor={deleteColor} onMoveColor={moveColor} onChange={applyTextColor} onClear={clearTextColor}/>
       <ColorPicker label="Background highlight" icon={<Highlighter size={15}/>} value={state.highlightColor ?? highlightColor} recent={recentColors} onChange={applyHighlight} onClear={clearHighlight}/>
@@ -447,15 +468,21 @@ export function RichNoteEditor({ noteId, content, focusOnMount, subjects, items,
       <ToolbarButton label="Undo (Ctrl+Z)" disabled={!state.canUndo} onClick={() => editor.chain().focus().undo().run()}><Undo2 size={16}/></ToolbarButton>
       <ToolbarButton label="Redo (Ctrl+Shift+Z)" disabled={!state.canRedo} onClick={() => editor.chain().focus().redo().run()}><Redo2 size={16}/></ToolbarButton>
     </div>
-    <section className="editor-outline" aria-label="In this note"><div className="important-notes-heading"><h2>In this note</h2><span>{outlineCount(outline)}</span></div>{outline.length?<nav aria-label="Section and heading outline">{renderOutline(outline)}</nav>:<p>Add headings or sections to create an outline.</p>}</section>
-    <section className="important-notes" aria-label="Important Notes">
-      <div className="important-notes-heading"><h2><Star size={15}/>Important Notes</h2><span>{importantNotes.length}</span></div>
-      {importantNotes.length ? <ol>{importantNotes.map((note, index) => <li key={note.id}>
-        <button className="important-source-link" type="button" aria-label={`Jump to important note ${index + 1}`} onClick={() => jumpToSource(note)}><span className="important-number">{String(index + 1).padStart(2,'0')}.</span><span>{note.text}</span><CornerUpRight size={14}/></button>
-        <button className="important-remove" type="button" aria-label={`Remove important marker ${index + 1}`} title="Remove marker" onClick={() => removeImportant(note)}><Trash2 size={14}/></button>
-      </li>)}</ol> : <p>Select text and use <Star size={12}/> to collect it here.</p>}
-    </section>
-    <EditorContent editor={editor} className="editor-content" onClick={onEditorClick} onContextMenu={onEditorContextMenu} />
+    <div className="editor-workspace">
+      {navigationOpen&&<button type="button" className="editor-nav-backdrop" aria-label="Close note navigation" onClick={()=>setNavigationOpen(false)}/>}
+      <aside className={`editor-navigation-rail${navigationOpen?' is-open':''}`} aria-label="Note navigation">
+        <div className="editor-nav-mobile-head"><strong>Note navigation</strong><button type="button" aria-label="Close note navigation" onClick={()=>setNavigationOpen(false)}><X size={16}/></button></div>
+        <section className="editor-outline" aria-label="In this note"><div className="important-notes-heading"><h2>In this note</h2><span>{outlineCount(outline)}</span></div>{outline.length?<nav aria-label="Section and heading outline">{renderOutline(outline)}</nav>:<p>Add headings or sections to create an outline.</p>}</section>
+        <section className="important-notes" aria-label="Important Notes">
+          <div className="important-notes-heading"><h2><Star size={15}/>Important Notes</h2><span>{importantNotes.length}</span></div>
+          {importantNotes.length ? <ol>{importantNotes.map((note, index) => <li key={note.id}>
+            <button className="important-source-link" type="button" aria-label={`Jump to important note ${index + 1}`} onClick={() => jumpToSource(note)}><span className="important-number">{String(index + 1).padStart(2,'0')}.</span><span>{note.text}</span><CornerUpRight size={14}/></button>
+            <button className="important-remove" type="button" aria-label={`Remove important marker ${index + 1}`} title="Remove marker" onClick={() => removeImportant(note)}><Trash2 size={14}/></button>
+          </li>)}</ol> : <p>Select text and use <Star size={12}/> to collect it here.</p>}
+        </section>
+      </aside>
+      <div className="editor-main-content"><EditorContent editor={editor} className="editor-content" onClick={onEditorClick} onContextMenu={onEditorContextMenu} /></div>
+    </div>
     {linkMessage&&<div className="link-message" role="status"><span>{linkMessage}</span><button type="button" onClick={()=>setLinkMessage('')} aria-label="Dismiss message"><X size={13}/></button></div>}
     {importantFeedback&&<div className="editor-feedback" role="status">⭐ {importantFeedback}</div>}
     {copyFeedback&&<div className="editor-feedback copy-feedback" role="status">{copyFeedback}</div>}

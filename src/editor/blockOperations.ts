@@ -1,5 +1,6 @@
 import { Extension, type Editor } from '@tiptap/core'
 import { Selection, TextSelection } from '@tiptap/pm/state'
+import { clearMultiCursors } from './multiCursor'
 
 type Direction = -1 | 1
 
@@ -33,6 +34,9 @@ function sectionEnd(blocks: readonly { type: { name: string }; attrs: Record<str
 }
 
 function moveRange(editor: Editor, direction: Direction): boolean {
+  // Block movement acts on the focused block; discard extra carets so a whole-document
+  // reorder cannot leave those positions mapped to unrelated blocks.
+  clearMultiCursors(editor.view)
   const { state } = editor
   const { blocks, positions } = topLevelBlocks(editor)
   const selectedIndex = selectedTopLevelIndex(editor, positions)
