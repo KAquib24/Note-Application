@@ -2,6 +2,7 @@ import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useM
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, ChevronRight, Clock3, Download, Eye, FileText, Home, List, Menu, MoreHorizontal, Pencil, Plus, Search, Star, Sun, Tag, Trash2, X, Settings as SettingsIcon } from 'lucide-react'
 import { storage } from './storage'
+import { getCloudWorkspaceKey, getCurrentUser, getUserWorkspaceKey, login, logout, signUp, type AuthUser } from './auth'
 import type { JSONContent } from '@tiptap/core'
 import { EMPTY_DOCUMENT, toDocument } from './editor/document'
 import { buildExport, downloadText, renderExport, safeFilename, type ExportItem, type ExportSubject } from './export/pipeline'
@@ -73,24 +74,108 @@ function validWorkspace(value: Workspace): Workspace {
   const items = raw.map(i=>{let parent=i.parentId&&ids.has(i.parentId)?byId.get(i.parentId):undefined;if(parent?.subjectId!==i.subjectId||parent?.id===i.id)parent=undefined;const seenParents=new Set([i.id]);let cursor=parent;while(cursor){if(seenParents.has(cursor.id)){parent=undefined;break}seenParents.add(cursor.id);cursor=cursor.parentId?byId.get(cursor.parentId):undefined}return {...i,parentId:parent?.id??null,description:typeof i.description==='string'?i.description:'',tags:Array.isArray(i.tags)?i.tags.filter((tag):tag is string=>typeof tag==='string'):[],favorite:Boolean(i.favorite),content:toDocument(i.content)}})
   return {subjects,items}
 }
+
+type AuthMode = 'login' | 'signup'
+
+function AuthGate({ onAuthenticated }: { onAuthenticated: (user: AuthUser) => void }) {
+  const [mode, setMode] = useState<AuthMode>('login')
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    const result = mode === 'login' ? login(email, password) : signUp(email, password, name)
+    if (!result.ok) {
+      setError(result.message)
+      return
+    }
+    onAuthenticated(result.user)
+  }
+  return <div className="dialog-backdrop" role="presentation"><form className="hierarchy-dialog metadata-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title" onSubmit={submit}><div className="dialog-head"><h2 id="auth-title">{mode === 'login' ? 'Log in' : 'Create account'}</h2><button type="button" aria-label="Close auth" disabled><X size={18}/></button></div>{mode === 'signup' && <label className="dialog-label">Display name<input value={name} onChange={e => setName(e.target.value)} placeholder="Your name" maxLength={40}/></label>}<label className="dialog-label">Email<input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required /></label><label className="dialog-label">Password<input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Your password" minLength={4} required /></label>{error && <p className="dialog-error" role="alert">{error}</p>}<div className="dialog-actions"><button type="button" className="secondary-button" onClick={() => setMode(mode === 'login' ? 'signup' : 'login')}>{mode === 'login' ? 'Need an account?' : 'Back to login'}</button><button className="primary-button" type="submit">{mode === 'login' ? 'Login' : 'Sign up'}</button></div></form></div>
+}
+
+function mergeWorkspace(base: Workspace, incoming: Workspace): Workspace {
+  const merged = new Map<string, HierarchyItem>()
+  for (const item of [...base.items, ...incoming.items]) {
+    const existing = merged.get(item.id)
+    if (!existing || (item.updatedAt ?? 0) > (existing.updatedAt ?? 0)) merged.set(item.id, item)
+  }
+  const subjects = [...base.subjects, ...incoming.subjects].reduce<Subject[]>((items, subject) => {
+    const existing = items.find(entry => entry.id === subject.id)
+    if (existing) {
+      const next = existing.updatedAt >= subject.updatedAt ? existing : { ...existing, ...subject }
+      return items.map(entry => entry.id === subject.id ? next : entry)
+    }
+    items.push(subject)
+    return items
+  }, [])
+  return validWorkspace({ subjects, items: [...merged.values()] })
+}
+
 function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => getCurrentUser())
+  const [authOpen, setAuthOpen] = useState<boolean>(() => !getCurrentUser())
   const [theme,setTheme] = useState<Theme>(()=>storage.get<Theme>('theme','dark'))
-  const [data,setData] = useState<Workspace>(()=>validWorkspace(storage.get<Workspace>('workspace-v1',seedWorkspace())))
+  const [data,setData] = useState<Workspace>(() => {
+    const user = getCurrentUser()
+    return validWorkspace(storage.get<Workspace>(getUserWorkspaceKey(user), seedWorkspace()))
+  })
   const dataRef = useRef(data)
-  const [expanded,setExpandedState] = useState<Set<string>>(()=>new Set(storage.get<string[]>('expanded-v1',[data.subjects[0]?.id].filter((id):id is string=>Boolean(id)))))
+  const [expanded,setExpandedState] = useState<Set<string>>(()=>new Set(storage.get<string[]>(getCurrentUser() ? `expanded-v1:${getCurrentUser()!.id}` : 'expanded-v1',[data.subjects[0]?.id].filter((id):id is string=>Boolean(id)))))
   const [draft,setDraft] = useState<Draft|null>(null)
   const [deleteTarget,setDeleteTarget] = useState<{type:'subject'|'item';id:string}|null>(null)
   const [error,setError] = useState('')
   const location = useLocation()
   const navigate = useNavigate()
+  const handleAuthenticated = useCallback((user: AuthUser) => {
+    setAuthUser(user)
+    setAuthOpen(false)
+    const localWorkspace = validWorkspace(storage.get<Workspace>(getUserWorkspaceKey(user), seedWorkspace()))
+    const cloudWorkspace = validWorkspace(storage.get<Workspace>(getCloudWorkspaceKey(user), localWorkspace))
+    const merged = mergeWorkspace(localWorkspace, cloudWorkspace)
+    setData(merged)
+    dataRef.current = merged
+    setExpandedState(new Set(storage.get<string[]>(`expanded-v1:${user.id}`, [merged.subjects[0]?.id].filter((id): id is string => Boolean(id)))))
+    storage.set(getUserWorkspaceKey(user), merged)
+    storage.set(getCloudWorkspaceKey(user), merged)
+  }, [])
+  useEffect(() => {
+    if (!authUser) {
+      setAuthOpen(true)
+      setData(seedWorkspace())
+      setExpandedState(new Set())
+      return
+    }
+    const localWorkspace = validWorkspace(storage.get<Workspace>(getUserWorkspaceKey(authUser), seedWorkspace()))
+    const cloudWorkspace = validWorkspace(storage.get<Workspace>(getCloudWorkspaceKey(authUser), localWorkspace))
+    const merged = mergeWorkspace(localWorkspace, cloudWorkspace)
+    setData(merged)
+    dataRef.current = merged
+    setExpandedState(new Set(storage.get<string[]>(`expanded-v1:${authUser.id}`, [merged.subjects[0]?.id].filter((id): id is string => Boolean(id)))))
+  }, [authUser])
+  useEffect(() => { if (authUser) storage.set(`expanded-v1:${authUser.id}`, [...expanded]) }, [authUser, expanded])
   useEffect(()=>{const resolved=theme==='system'?(window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):theme;document.documentElement.dataset.theme=resolved;storage.set('theme',theme)},[theme])
   useEffect(()=>{if(theme!=='system')return;const media=window.matchMedia('(prefers-color-scheme: light)');const update=()=>{document.documentElement.dataset.theme=media.matches?'light':'dark'};media.addEventListener('change',update);return()=>media.removeEventListener('change',update)},[theme])
-  const commit = (next: Workspace) => { dataRef.current=next;setData(next); if (!storage.set('workspace-v1',next)) setError('Could not save your changes. Check browser storage and try again.') }
+  const commit = (next: Workspace) => {
+    const persisted = validWorkspace(next)
+    dataRef.current = persisted
+    setData(persisted)
+    const key = authUser ? getUserWorkspaceKey(authUser) : 'workspace-v1'
+    const cloudKey = authUser ? getCloudWorkspaceKey(authUser) : 'cloud-workspace-v1'
+    if (!storage.set(key, persisted)) setError('Could not save your changes. Check browser storage and try again.')
+    if (authUser && navigator.onLine) storage.set(cloudKey, persisted)
+  }
   const saveDocument = (id:string,doc:JSONContent) => {
     const current=dataRef.current;const item=current.items.find(entry=>entry.id===id);if(!item)return false
     const next={...current,items:current.items.map(entry=>entry.id===id?{...entry,content:doc,updatedAt:Date.now()}:entry)}
-    dataRef.current=next;setData(next)
-    if(!storage.set('workspace-v1',next)){dataRef.current=current;setData(current);return false}
+    const persisted = validWorkspace(next)
+    dataRef.current=persisted;setData(persisted)
+    const key = authUser ? getUserWorkspaceKey(authUser) : 'workspace-v1'
+    const cloudKey = authUser ? getCloudWorkspaceKey(authUser) : 'cloud-workspace-v1'
+    if(!storage.set(key,persisted)){dataRef.current=current;setData(current);return false}
+    if (authUser && navigator.onLine) storage.set(cloudKey, persisted)
     return true
   }
   const openDialog = (d:Draft) => { setError('');setDraft(d) }
@@ -144,23 +229,49 @@ function App() {
     if(type==='subject'){const sorted=[...data.subjects].sort((a,b)=>a.order-b.order),from=sorted.findIndex(s=>s.id===id);if(from<0)return;const [entry]=sorted.splice(from,1),to=sorted.findIndex(s=>s.id===targetId);if(to<0)return;sorted.splice(to,0,entry);commit({...data,subjects:sorted.map((s,order)=>({...s,order}))})}
     else {const source=data.items.find(i=>i.id===id),target=data.items.find(i=>i.id===targetId);if(!source||!target||source.subjectId!==target.subjectId||source.parentId!==target.parentId)return;const sorted=data.items.filter(i=>i.subjectId===source.subjectId&&i.parentId===source.parentId).sort((a,b)=>a.order-b.order),from=sorted.findIndex(i=>i.id===id);const [entry]=sorted.splice(from,1),to=sorted.findIndex(i=>i.id===targetId);if(to<0)return;sorted.splice(to,0,entry);const ranks=new Map(sorted.map((i,order)=>[i.id,order]));commit({...data,items:data.items.map(i=>ranks.has(i.id)?{...i,order:ranks.get(i.id)!}:i)})}
   }
-  const setExpanded=(values:Set<string>)=>{setExpandedState(values);storage.set('expanded-v1',[...values])}
+  const setExpanded=(values:Set<string>)=>{setExpandedState(values);storage.set(authUser ? `expanded-v1:${authUser.id}` : 'expanded-v1',[...values])}
   const toggleExpanded=(id:string)=>{const next=new Set(expanded);next.has(id)?next.delete(id):next.add(id);setExpanded(next)}
   const api:HierarchyApi={data,expanded,error,location:location.pathname,openDialog,closeDialog:()=>{setDraft(null);setError('')},createSubject,createItem,rename,toggleFavorite,remove,reorder,moveBefore,toggleExpanded,setExpanded,openDelete:setDeleteTarget,closeDelete:()=>setDeleteTarget(null),saveDocument}
   const [mobileOpen,setMobileOpen]=useState(false)
+  const handleLogout = () => {
+    logout()
+    setAuthUser(null)
+    setAuthOpen(true)
+    const guest = validWorkspace(storage.get<Workspace>('workspace-v1', seedWorkspace()))
+    setData(guest)
+    dataRef.current = guest
+    const expandedIds = [guest.subjects[0]?.id].filter((id): id is string => Boolean(id))
+    setExpandedState(new Set(storage.get<string[]>('expanded-v1', expandedIds)))
+  }
   useEffect(()=>{if(!mobileOpen)return;const close=(event:KeyboardEvent)=>{if(event.key==='Escape')setMobileOpen(false)};window.addEventListener('keydown',close);return()=>window.removeEventListener('keydown',close)},[mobileOpen])
-  return <Ctx.Provider value={api}><div className="app-shell"><Topbar theme={theme} toggle={()=>setTheme(theme==='dark'?'light':'dark')} setTheme={setTheme}/>
-    <div className="dashboard-layout phase1-shell">{mobileOpen&&<button className="mobile-sidebar-backdrop" aria-label="Close navigation" onClick={()=>setMobileOpen(false)}/>}<Sidebar mobileOpen={mobileOpen} closeMobile={()=>setMobileOpen(false)} />
-      <Routes><Route path="/" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} /><Route path="/subject/:subjectId" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} /><Route path="/note/:noteId" element={<NotePage openMobile={()=>setMobileOpen(true)} />} /><Route path="*" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} /></Routes>
-    </div>{draft&&<EditDialog draft={draft}/ >}{deleteTarget&&<DeleteDialog target={deleteTarget}/ >}{error&&<div className="toast-error" role="alert">{error}<button onClick={()=>setError('')} aria-label="Dismiss"><X size={15}/></button></div>}
-  </div></Ctx.Provider>
+  return (
+    <Ctx.Provider value={api}>
+      <div className="app-shell">
+        {authOpen && !authUser ? <AuthGate onAuthenticated={handleAuthenticated} /> : null}
+        <Topbar theme={theme} toggle={()=>setTheme(theme==='dark'?'light':'dark')} setTheme={setTheme} user={authUser} onAuth={() => setAuthOpen(true)} onLogout={handleLogout} />
+        <div className="dashboard-layout phase1-shell">
+          {mobileOpen && <button className="mobile-sidebar-backdrop" aria-label="Close navigation" onClick={()=>setMobileOpen(false)} />}
+          <Sidebar mobileOpen={mobileOpen} closeMobile={()=>setMobileOpen(false)} />
+          <Routes>
+            <Route path="/" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} />
+            <Route path="/subject/:subjectId" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} />
+            <Route path="/note/:noteId" element={<NotePage openMobile={()=>setMobileOpen(true)} />} />
+            <Route path="*" element={<Dashboard openMobile={()=>setMobileOpen(true)} />} />
+          </Routes>
+        </div>
+        {draft && <EditDialog draft={draft} />}
+        {deleteTarget && <DeleteDialog target={deleteTarget} />}
+        {error && <div className="toast-error" role="alert">{error}<button onClick={()=>setError('')} aria-label="Dismiss"><X size={15}/></button></div>}
+      </div>
+    </Ctx.Provider>
+  )
 }
 export default App
 
-function Topbar({theme,toggle,setTheme}:{theme:Theme;toggle:()=>void;setTheme:(value:Theme)=>void}) {const {data}=useHierarchy();const navigate=useNavigate();const [query,setQuery]=useState(''),[open,setOpen]=useState(false),[settings,setSettings]=useState(false),[selected,setSelected]=useState(0);const input=useRef<HTMLInputElement>(null);const results=useMemo(()=>{const q=query.trim().toLocaleLowerCase();if(!q)return [];const text=(node:JSONContent):string=>[node.text,...(node.content??[]).map(text)].filter(Boolean).join(' ');return data.items.filter(item=>item.title.toLocaleLowerCase().includes(q)||(item.description??'').toLocaleLowerCase().includes(q)||(item.tags??[]).some(tag=>tag.includes(q))||text(item.content).toLocaleLowerCase().includes(q)).map(item=>{const subject=data.subjects.find(s=>s.id===item.subjectId);const parents:HierarchyItem[]=[];let parent=item.parentId?data.items.find(i=>i.id===item.parentId):undefined;while(parent){parents.unshift(parent);parent=parent.parentId?data.items.find(i=>i.id===parent!.parentId):undefined}const body=text(item.content);const at=body.toLocaleLowerCase().indexOf(q);return {item,path:[subject?.title,...parents.map(p=>p.title)].filter(Boolean).join(' → '),snippet:at<0?(item.tags??[]).filter(tag=>tag.includes(q)).map(tag=>`#${tag}`).join(' '):`…${body.slice(Math.max(0,at-48),Math.min(body.length,at+100))}…`}}).slice(0,30)},[data,query]);
+function Topbar({theme,toggle,setTheme,user,onAuth,onLogout}:{theme:Theme;toggle:()=>void;setTheme:(value:Theme)=>void;user:AuthUser|null;onAuth:()=>void;onLogout:()=>void}) {const {data}=useHierarchy();const navigate=useNavigate();const [query,setQuery]=useState(''),[open,setOpen]=useState(false),[settings,setSettings]=useState(false),[selected,setSelected]=useState(0);const input=useRef<HTMLInputElement>(null);const results=useMemo(()=>{const q=query.trim().toLocaleLowerCase();if(!q)return [];const text=(node:JSONContent):string=>[node.text,...(node.content??[]).map(text)].filter(Boolean).join(' ');return data.items.filter(item=>item.title.toLocaleLowerCase().includes(q)||(item.description??'').toLocaleLowerCase().includes(q)||(item.tags??[]).some(tag=>tag.includes(q))||text(item.content).toLocaleLowerCase().includes(q)).map(item=>{const subject=data.subjects.find(s=>s.id===item.subjectId);const parents:HierarchyItem[]=[];let parent=item.parentId?data.items.find(i=>i.id===item.parentId):undefined;while(parent){parents.unshift(parent);parent=parent.parentId?data.items.find(i=>i.id===parent!.parentId):undefined}const body=text(item.content);const at=body.toLocaleLowerCase().indexOf(q);return {item,path:[subject?.title,...parents.map(p=>p.title)].filter(Boolean).join(' → '),snippet:at<0?(item.tags??[]).filter(tag=>tag.includes(q)).map(tag=>`#${tag}`).join(' '):`…${body.slice(Math.max(0,at-48),Math.min(body.length,at+100))}…`}}).slice(0,30)},[data,query]);
   const show=()=>{setOpen(true);setSettings(false);requestAnimationFrame(()=>input.current?.focus())};useEffect(()=>{const key=(e:KeyboardEvent)=>{if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='k'){e.preventDefault();show()}if(e.key==='Escape'){setOpen(false);setSettings(false)}};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key)},[]);
   const select=(index:number)=>{const result=results[index];if(result){setOpen(false);setQuery('');navigate(`/note/${result.item.id}`)}};
-  return <><header className="topbar"><Link to="/" className="brand"><span className="brand-icon"><BookOpen size={25}/></span><span>NoteHub</span></Link><label className="global-search" onClick={show}><Search size={16}/><input value={query} onFocus={show} onChange={e=>setQuery(e.target.value)} placeholder="Search notes, topics..." readOnly/><kbd>Ctrl ⇧ K</kbd></label><div className="top-actions"><span className="sun-icon"><Sun size={18}/></span><button className="theme-switch" onClick={toggle} aria-label={`Switch to ${theme==='dark'?'light':'dark'} mode`}><span/></button><button className="avatar" onClick={()=>setSettings(true)} aria-label="Settings"><SettingsIcon size={15}/></button></div></header>
+  return <><header className="topbar"><Link to="/" className="brand"><span className="brand-icon"><BookOpen size={25}/></span><span>NoteHub</span></Link><label className="global-search" onClick={show}><Search size={16}/><input value={query} onFocus={show} onChange={e=>setQuery(e.target.value)} placeholder="Search notes, topics..." readOnly/><kbd>Ctrl ⇧ K</kbd></label><div className="top-actions"><span className="sun-icon"><Sun size={18}/></span><button className="theme-switch" onClick={toggle} aria-label={`Switch to ${theme==='dark'?'light':'dark'} mode`}><span/></button>{user ? <button className="avatar" onClick={onLogout} aria-label={`Log out ${user.name}`} title={`Log out ${user.name}`}>{user.name.slice(0,1).toUpperCase()}</button> : <button className="secondary-button" onClick={onAuth}>Login</button>}<button className="avatar" onClick={()=>setSettings(true)} aria-label="Settings"><SettingsIcon size={15}/></button></div></header>
     {open&&<div className="search-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)setOpen(false)}}><section className="search-dialog" role="dialog" aria-modal="true" aria-label="Search notes"><div className="search-dialog-input"><Search size={18}/><input ref={input} value={query} onChange={e=>{setQuery(e.target.value);setSelected(0)}} onKeyDown={e=>{if(e.key==='ArrowDown'){e.preventDefault();setSelected(i=>Math.min(results.length-1,i+1))}if(e.key==='ArrowUp'){e.preventDefault();setSelected(i=>Math.max(0,i-1))}if(e.key==='Enter'){e.preventDefault();select(selected)}if(e.key==='Escape')setOpen(false)}} placeholder="Search titles, sections, and note content…"/><kbd>ESC</kbd></div>{query.trim()&&results.length===0?<div className="search-empty"><strong>No results for “{query}”</strong><span>Try checking the spelling, using a shorter term, or searching another keyword.</span></div>:<div className="search-results" role="listbox">{results.map((r,i)=><button role="option" aria-selected={selected===i} key={r.item.id} onMouseEnter={()=>setSelected(i)} onClick={()=>select(i)}><strong>{r.item.icon} {r.item.title}</strong><small>{r.path}</small>{r.snippet&&<span>{r.snippet}</span>}</button>)}</div>}<footer><span>↑↓ Navigate</span><span>↵ Open</span><button onClick={()=>setOpen(false)}>Esc Close</button></footer></section></div>}
     {settings&&<div className="search-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)setSettings(false)}}><section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-head"><h2 id="settings-title">Settings</h2><button onClick={()=>setSettings(false)} aria-label="Close settings"><X size={18}/></button></div><nav className="settings-tabs"><a href="#appearance">Appearance</a><a href="#keyboard">Keyboard shortcuts</a><a href="#storage">Data / Storage</a></nav><section id="appearance"><h3>Appearance</h3><label className="dialog-label">Theme<select value={theme} onChange={e=>setTheme(e.target.value as Theme)}><option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option></select></label><p>Dark mode is the default. System follows your device appearance.</p></section><section id="keyboard"><h3>Keyboard shortcuts</h3><dl className="shortcut-list"><div><dt>Bold</dt><dd>Ctrl + B</dd></div><div><dt>Italic</dt><dd>Ctrl + I</dd></div><div><dt>Underline</dt><dd>Ctrl + U</dd></div><div><dt>Insert link</dt><dd>Ctrl + K</dd></div><div><dt>Search notes</dt><dd>Ctrl + Shift + K</dd></div><div><dt>Move line</dt><dd>Alt + ↑ / ↓</dd></div></dl><p>Search uses Ctrl + Shift + K to keep the editor’s Ctrl + K link shortcut available.</p></section><section id="storage"><h3>Data / Storage</h3><p>Your workspace and appearance preference are stored locally in this browser. Export notes regularly to keep a separate backup.</p></section></section></div>}
   </>}
